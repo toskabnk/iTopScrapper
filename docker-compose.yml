@@ -2,7 +2,7 @@ version: "3"
 services:
   scraper:
     build: .
-    container_name: scraper
+    container_name: itop-scraper
     restart: always
     tmpfs:
       - /tmp:size=512m
