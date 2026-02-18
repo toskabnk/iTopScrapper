@@ -230,7 +230,7 @@ def parsear_tiempo_itop(texto):
     return minutos
 
 def ejecutar_servicio():
-    driver = iniciar_driver()
+    driver = iniciar_driver_linux()
 
     try:
         login(driver)
