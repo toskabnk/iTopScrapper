@@ -22,6 +22,9 @@ PASSWORD = os.getenv("ITOP_PASSWORD")
 LOGIN_URL = os.getenv("ITOP_URL")
 DATA_URL = os.getenv("ITOP_DATA_URL")
 
+#FILTERS
+GRUPOS = os.getenv("ITOP_GRUPOS", "Centros de Control,Trading").split(",")
+
 #SQL DATA
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -94,13 +97,19 @@ def login(driver):
         driver.find_element(By.NAME, "auth_pwd").send_keys(os.getenv("ITOP_PASSWORD"))
         driver.find_element(By.NAME, "auth_pwd").submit()
 
-        #Esperar a que cargue la tabla
-        WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.CLASS_NAME, "listResults"))
-        )
+        #Esperar a que carguen las tablas del dashboard (iTop 3: DataTables con data-status="loaded")
+        esperar_tablas(driver)
+        return True
     except Exception as e:
         print(f"Error durante el login: {e}")
-        driver.quit()
+        return False
+
+def esperar_tablas(driver, timeout=30):
+    #En iTop 3 las listas son DataTables que se rellenan por JavaScript. Cuando terminan de pintarse,
+    #iTop marca la tabla con data-status="loaded".
+    WebDriverWait(driver, timeout).until(
+        EC.presence_of_element_located((By.CSS_SELECTOR, "table.ibo-datatable[data-status='loaded']"))
+    )
 
 def esta_logueado(driver):
     try:
@@ -111,39 +120,74 @@ def esta_logueado(driver):
     except:
         return False
 
+def buscar_columna(headers, nombre, defecto):
+    nombre = nombre.lower()
+    return next((i for i, h in enumerate(headers) if nombre in h), defecto)
+
+def texto_celda(fila, cols, etiqueta, idx):
+    #iTop 3 etiqueta cada celda con data-attribute-label (p.ej. "Title", "Priority", "TTR Deadline").
+    #Si no existe, se usa la posición detectada a partir de la cabecera.
+    celda = fila.find("td", attrs={"data-attribute-label": etiqueta})
+    if celda is None and idx < len(cols):
+        celda = cols[idx]
+    return celda.get_text(strip=True) if celda is not None else ""
+
 def scrapear_con_selenium(driver):
     try:
         print("Scrapeando datos de iTop...")
+        try:
+            esperar_tablas(driver)
+        except Exception:
+            print("Aviso: las tablas no llegaron a marcarse como cargadas, se intenta igualmente.")
+
         soup = BeautifulSoup(driver.page_source, 'html.parser')
-        
-        #Buscar el bloque exacto
+
+        #Buscar el bloque exacto (iTop 3: panel de DataTable con el título en .ibo-panel--title)
         bloque_objetivo = None
-        for dashlet in soup.find_all("div", class_="dashlet"):
-            header = dashlet.find("h1")
-            #Usamos "assigned to my team" porque es el texto que aparece en la cabecera del bloque, pero sin importar mayúsculas/minúsculas. Además, nos aseguramos de no confundirlo con el bloque de "Centros de Control" que también tiene esa frase pero no es el que queremos.
-            if header and "assigned to my team" in header.get_text().lower() and "Centros de Control" not in header.get_text():
-                bloque_objetivo = dashlet
+        for panel in soup.find_all("div", class_="ibo-datatable-panel"):
+            header = panel.find(class_="ibo-panel--title")
+            if not header:
+                continue
+            titulo_bloque = header.get_text(" ", strip=True).lower()
+            #Buscamos "assigned to my team" sin importar mayúsculas/minúsculas, excluyendo los bloques filtrados por los grupos de ITOP_GRUPOS (como "Centros de Control" o "Trading").
+            if "assigned to my team" in titulo_bloque and not any(group.strip().lower() in titulo_bloque for group in GRUPOS if group.strip()):
+                bloque_objetivo = panel
                 break
-        
+
         if not bloque_objetivo:
-            return "No se encontró el bloque (Dashlet) de tickets asignados."
+            print("No se encontró el bloque de tickets asignados (assigned to my team).")
+            return None
 
-        #Mapeo Dinámico de Columnas
-        tabla = bloque_objetivo.find("table", class_="listResults")
-        headers = [th.get_text(strip=True).lower() for th in tabla.find("thead").find_all("th")]
-        
-        #Buscamos en qué posición está cada dato
-        idx_titulo = next((i for i, h in enumerate(headers) if "Title" in h), 1) 
-        idx_prioridad = next((i for i, h in enumerate(headers) if "Priority" in h), 7)
-        idx_ttr = next((i for i, h in enumerate(headers) if "TTR Deadline" in h), 8)
+        #Con scroll activado DataTables separa la tabla en dos: una con la cabecera visible y otra con el cuerpo.
+        tablas = bloque_objetivo.find_all("table", class_="ibo-datatable")
+        headers = []
+        for t in tablas:
+            ths = [th.get_text(strip=True).lower() for th in t.find_all("th")]
+            if any(ths):
+                headers = ths
+                break
 
+        #Mapeo dinámico de columnas (por si alguna celda no trae data-attribute-label)
+        idx_titulo = buscar_columna(headers, "Title", 1)
+        idx_prioridad = buscar_columna(headers, "Priority", 7)
+        idx_ttr = buscar_columna(headers, "TTR Deadline", 8)
         print(f"Detectadas columnas: Título[{idx_titulo}], Prioridad[{idx_prioridad}], TTR[{idx_ttr}]")
 
-        print(f"Total de filas encontradas: {len(tabla.find('tbody').find_all('tr'))}")
+        filas = []
+        for t in tablas:
+            tbody = t.find("tbody")
+            if tbody:
+                filas.extend(tbody.find_all("tr"))
+        #Fila "No data available" (td único con clase dataTables_empty) cuando no hay tickets
+        filas = [f for f in filas if f.find("td") and not f.find("td", class_="dataTables_empty")]
 
-        #Procesar filas
-        filas = tabla.find("tbody").find_all("tr")
-        
+        print(f"Total de filas encontradas: {len(filas)}")
+
+        #Comprobación contra el contador "Total: N objects." del panel (por si la tabla estuviera paginada)
+        contador = bloque_objetivo.find("span", class_="ibo-datatable--result-count")
+        if contador and contador.get_text(strip=True).isdigit() and int(contador.get_text(strip=True)) != len(filas):
+            print(f"Aviso: el panel indica {contador.get_text(strip=True)} tickets pero se han leído {len(filas)} filas.")
+
         stats = {
             "total": 0,
             "prioridad": {"Critical": 0, "High": 0, "Medium": 0, "Low": 0},
@@ -151,31 +195,23 @@ def scrapear_con_selenium(driver):
             "tickets_zabbix": 0,
             "ttr_pasado": 0
         }
-        
+
         ttr_values = []
 
         for fila in filas:
             cols = fila.find_all("td")
-            
-
-            #Si la fila tiene menos columnas de las necesarias, la saltamos
-            if not cols or len(cols) <= max(idx_titulo, idx_prioridad, idx_ttr):
-                continue
 
             try:
-                #Extraemos datos usando los índices detectados
-                titulo = cols[idx_titulo].get_text(strip=True)
-                prioridad = cols[idx_prioridad].get_text(strip=True)
-                ttr_texto = cols[idx_ttr].get_text(strip=True)
+                titulo = texto_celda(fila, cols, "Title", idx_titulo)
+                prioridad = texto_celda(fila, cols, "Priority", idx_prioridad)
+                ttr_texto = texto_celda(fila, cols, "TTR Deadline", idx_ttr)
 
                 stats["total"] += 1
 
-                #Clasificación (Limpiamos espacios por si acaso)
-                prioridad = prioridad.strip()
+                #Clasificación
+                prioridad = prioridad.strip().capitalize()
                 if prioridad in stats["prioridad"]:
                     stats["prioridad"][prioridad] += 1
-                elif prioridad == "":
-                    pass 
 
                 #Zabbix
                 if "zabbix" in titulo.lower():
@@ -190,7 +226,7 @@ def scrapear_con_selenium(driver):
                     #Contar tickets con TTR pasado
                     if minutos < 0:
                         stats["ttr_pasado"] += 1
-            
+
             except Exception as e:
                 print(f"Fila ignorada por error inesperado: {e}")
                 continue
@@ -202,11 +238,8 @@ def scrapear_con_selenium(driver):
         return stats
 
     except Exception as e:
-        print(f"Error: {e}")
-        driver.quit()
-        time.sleep(5)
-        driver = iniciar_driver()
-        login(driver)
+        print(f"Error scrapeando: {e}")
+        return None
 
 def parsear_tiempo_itop(texto):
     if not texto: return 0
@@ -239,8 +272,19 @@ def ejecutar_servicio():
             stats = scrapear_con_selenium(driver)
             print(f"Estadísticas actuales: {stats}")
 
-            guardar_en_supabase(stats)
-            publicar_mqtt(stats)
+            if stats is not None:
+                guardar_en_supabase(stats)
+                publicar_mqtt(stats)
+            else:
+                #Si falla el scraping, reiniciamos el navegador y volvemos a loguear
+                print("No se han podido obtener datos. Reiniciando el navegador...")
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                time.sleep(5)
+                driver = iniciar_driver_linux()
+                login(driver)
             
             #Suma al intervalo un random entre 0 y 60.
             time.sleep(INTERVAL + random.randint(0, 60))
